@@ -1,0 +1,442 @@
+How NOT to write makefiles and shell scripts.
+=============================================
+
+Common mistakes and how to avoid them
+
+Common shell script (makefile) mistakes are described using the fuel-main
+code for illustration. Example of such mistakes are
+- wrong error handling with pipelines
+- inadvertently ignoring the errors
+- wrong conditional expressions
+
+Also some aspects of UNIX shell scripting are considered, such as
+- function calls and subshell subtleties.
+- parsing with shell: IFS trick, string substitution.
+- portability between UNIX shells.
+
+
+Episode 1. Pipeline strikes back.
+---------------------------------
+
+[script script11.sh]
+#!/bin/sh
+set +e
+set -x
+
+apt-get install --print-uris --yes -qq foo
+echo $?
+# This is WRONG
+apt-get install --print-uris --yes -qq foo | grep ^\\\\' | cut -d\\\\'
+echo $?
+
+[endscript]
+
+[script script12.sh]
+#!/bin/sh
+set -ex
+
+pkg="liblapack-dev"
+if ! apt-get install --print-uris --yes -qq $pkg > "downloads_${pkg}.tmp"; then
+	echo "downloader: failed to process the package: \\\\"$pkg\\\\"" >&2
+	exit 1
+fi
+sed -r -n -e "s/^[']([^']+).*$/\\\\1/p" -i "downloads_${pkg}.tmp"
+mv "downloads_${pkg}.tmp" "downloads_${pkg}.list"
+
+[endscript]
+
+
+Episode 2. Failure to fail.
+---------------------------
+
+[script makefile21.mk]
+#!/usr/bin/env make -f
+
+all: versions.txt
+
+# This rule is WRONG
+versions.txt:
+	sh -c '( echo b 1; echo a 2; exit 1 )' | sort -u > $@
+
+clean:
+	-rm -f versions.txt
+[endscript]
+
+The target gets created even if generate-versions fails
+
+
+[script makefile22.mk]
+#!/usr/bin/env make -f
+
+all: versions.txt
+
+versions.txt:
+	sh -c '( echo b 1; echo a 2; exit 1 )' > $@.tmp.1
+	sort -u < $@.tmp.1 > $@.tmp
+	mv $@.tmp $@
+
+clean:
+	-rm -f versions.txt
+[endscript]
+
+
+Episode 3. Subshell weirdness.
+------------------------------
+
+Function calls in a shell script are typically processed by a child
+process
+
+[script script31.sh]
+#!/bin/sh
+set -e
+
+l=0
+
+buggy () {
+	l=$(($l+1))
+	echo "$l"
+}
+
+result="`buggy`"
+echo "result=$result"
+echo "l=$l" # oops
+[endscript]
+
+A bit more elaborate example
+
+[script script32.sh]
+#!/bin/sh
+set -e
+
+# BUG
+match_cnt=0
+echo 'AB;BC;DE;FG' | tr ';' '\\\\n' | while read entry; do
+	case $entry in
+		B*|*B*|*B)
+		match_cnt=$((cnt+1))
+		echo "match_cnt=${match_cnt}"
+		;;
+	esac
+done
+
+echo "top level: match_cnt=${match_cnt}"
+[endscript]
+
+
+The code is exectued in a subshell, hence the match_cnt in the main shell
+process is not updated.
+
+
+Episode 4. Shell parsing facilites: IFS trick, string substitution.
+-------------------------------------------------------------------
+
+[script script41.sh]
+#!/bin/sh
+set -e
+
+match_cnt=0
+IFS=';'
+set -- 'AB;BC;DE;FG'
+unset IFS
+for entry; do
+	case $entry in
+		B*|*B*|*B)
+		match_cnt=$((cnt+1))
+		echo "match_cnt=${match_cnt}"
+		;;
+	esac
+done
+
+echo "top level: match_cnt=${match_cnt}"
+[endscript]
+
+
+Note: no subprocesses, hence no problem (side effect: the script get a bit faster)
+
+
+Episode 5. String expansion at work.
+------------------------------------
+
+[script script51.sh]
+#!/bin/sh
+set -ex
+
+path="/a/b/atop_1.26-2_amd64.deb"
+
+# cut a largest prefix matching the pattern
+filename="${path##*/}"
+
+# cut a smallest suffix matching the pattern
+dirname="${path%/*}"
+
+# skip the .deb suffix
+name_ver_arch="${filename%.*}"
+# the suffix itself
+suffix="${filename##*.}"
+
+IFS='_'
+set -- $name_ver_arch
+unset IFS
+pkg="$1"
+ver="$2"
+arch="$3"
+[endscript]
+
+[script script52.sh]
+#!/bin/sh
+set -ex
+#
+# '_'.join(['a', 'b', 'c']) in shell
+
+join () {
+	local str=''
+	local separator="$1"
+	shift
+	for val in $@; do
+		str="${str}${str:+${separator}}${val}"
+	done
+	echo "$str"
+}
+
+val="`join _ a b c d`"
+[endscript]
+
+[script script53.sh]
+#!/bin/sh
+set -ex
+#
+# '_'.join(['a', 'b', 'c']) in shell, yet another variant
+
+join () {
+	# Warning: this variant is not quite correct
+	local separator="$1"
+	shift
+	IFS="$separator"
+	echo "$*"
+	unset IFS
+}
+
+val="`join _ a b c d`"
+[endscript]
+
+
+Episode 6. Conditionals pitfalls.
+---------------------------------
+
+[script script61.sh]
+#!/bin/sh
+set -e
+
+logfile="foo.log"
+# simulate the output of do_foo --log-file=${logfile}
+cat > ${logfile} << EOF
+baz: ok
+barf: ok
+foo: ERROR
+EOF
+
+set -x
+if grep -q -e 'ERROR' "${logfile}"; then
+	echo "foo: something went wrong"
+	# try to recover
+fi
+[endscript]
+
+[script script62.sh]
+#!/bin/sh
+set -e
+
+logfile="foo.log"
+# simulate the output of do_foo --log-file=${logfile}
+cat > ${logfile} << EOF
+baz: ok
+barf: ok
+foo: ok
+EOF
+
+# WRONG
+
+set -x
+grep -q -e 'ERROR' "${logfile}"
+
+if [ $? -eq 0 ]; then
+	echo "foo: something went wrong"
+fi
+[endscript]
+
+
+[script script63.sh]
+#!/bin/sh
+set -e
+
+logfile="foo.log"
+# simulate the output of do_foo --log-file=${logfile}
+cat > ${logfile} << EOF
+baz: ok
+barf: ok
+foo: ERROR
+EOF
+
+# Silly
+set -x
+if [ `grep -e 'ERROR' "${logfile}" | wc -l` != 0 ]; then
+	echo "foo: something went wrong"
+	# try to recover
+fi
+[endscript]
+
+By the way, numeric comparison is quite cumbersome:
+
+# WRONG, don't use this
+
+[script script64.sh]
+#!/bin/sh
+set -ex
+
+buggy () {
+	local number="$1"
+	if [ $number -ne 42 ]; then
+		return 1
+	else
+		echo 'do something'
+		return 0
+	fi
+}
+
+buggy abc
+[endscript]
+
+
+Correct way 1, keep it simple:
+
+[script script65.sh]
+#!/bin/sh
+set -ex
+
+foo () {
+	local number="$1"
+	if [ "$number" != "42" ]; then
+		return 1
+	else
+		echo 'do something'
+	fi
+}
+
+foo abc
+[endscript]
+
+
+Correct way 2, trying hard:
+
+[script script66.sh]
+#!/bin/sh
+set -x
+
+foo () {
+	local number="$1"
+	[ -z "$number" ] && return 1
+	case "$number" in
+		*[!0-9]*)
+		# not a number
+		return 1
+		;;
+	esac
+	if [ $number -ne 42 ]; then
+		return 1
+	else
+		echo 'do something'
+	fi
+}
+
+foo abc
+foo 12
+foo 42
+[endscript]
+
+This makes sense if one needs to verify if the value is within a certain range, i.e
+
+[script script67.sh]
+#!/bin/sh
+set -x
+
+validate_percentage () {
+	local val="$1"
+	[ -z "$val" ] && return 2
+	case "$val" in
+		*[!0-9]*)
+		# not a number
+		return 2
+		;;
+	esac
+	if [ $val -le 100 ] && [ $val -ge 0 ]; then
+		return 0
+	else
+		# number is outside of the range [0, 100]
+		return 1
+	fi
+}
+
+validate_percentage abc
+validate_percentage 42
+validate_percentage 120
+[endscript]
+
+[script script68.sh]
+#!/bin/sh
+set -x
+
+module=$(find /lib/modules/`uname -r` -name foo.ko)
+
+
+# WRONG by construction
+if [ -n $module ]; then
+	echo do something wrong
+fi
+
+# Correct
+if [ -n "$module" ]; then
+	echo do someting right
+fi
+[endscript]
+
+The bottom line:
+- prefer to compare values as strings (if possible).
+- qoute values unless there's a good reason for not doing so.
+
+[script script69.sh]
+#!/bin/sh
+set -ex
+
+# '_'.join(['a', 'b', 'c', 'd']) in shell
+# more careful variant of script53.sh
+# null versus empty
+
+join () {
+	local separator="$1"
+	local save_IFS="$IFS"
+	local reset_ifs=''
+	[ -z "${IFS+x}" ] && reset_ifs='yes'
+	shift
+	set -- $@
+	IFS="$separator"
+	echo "$*"
+	if [ -n "$reset_ifs" ]; then
+		unset IFS
+	else
+		IFS="$save_IFS"
+	fi
+}
+
+unset IFS
+val="`join _ a b c d`"
+[endscript]
+
+
+Links.
+------
+
+1. "UNIX and Linux System Administration Handbook (4th Edition)"
+    by Evi Nemeth, Garth Snyder, Trent R. Hein, Ben Whaley
+2. "Advanced bash-scripting guide" http://www.tldp.org/LDP/abs/html
+
+# vim: set noet:
